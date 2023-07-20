@@ -22,8 +22,8 @@ import (
 )
 
 var (
-	providerNameFips    = C.CString("fips")
-	providerNameDefault = C.CString("default")
+	providerNameFips    = "fips"
+	providerNameDefault = "default"
 )
 
 var (
@@ -103,6 +103,14 @@ func Init() error {
 				return
 			}
 		}
+		
+		prov, found := syscall.Getenv("GO_OPENSSL_PROVIDER")
+		if found && vMajor < 3 {
+			errInit = errors.New("openssl: provider interface only supported for v3 and higher")
+			return
+		} else if found {
+			errInit = SetProvider(prov)
+		}
 	})
 	return errInit
 }
@@ -110,7 +118,7 @@ func Init() error {
 func dlopen(version string) unsafe.Pointer {
 	cv := C.CString("libcrypto.so." + version)
 	defer C.free(unsafe.Pointer(cv))
-	return C.dlopen(cv, C.RTLD_LAZY|C.RTLD_LOCAL)
+	return C.dlopen(cv, C.RTLD_LAZY|C.RTLD_GLOBAL)
 }
 
 func loadLibrary(version string) (unsafe.Pointer, error) {
@@ -163,7 +171,7 @@ func FIPS() bool {
 		}
 		// EVP_default_properties_is_fips_enabled can return true even if the FIPS provider isn't loaded,
 		// it is only based on the default properties.
-		return C.go_openssl_OSSL_PROVIDER_available(nil, providerNameFips) == 1
+		return C.go_openssl_OSSL_PROVIDER_available(nil, C.CString(providerNameFips)) == 1
 	default:
 		panic(errUnsuportedVersion())
 	}
@@ -187,22 +195,15 @@ func SetFIPS(enabled bool) error {
 		}
 		return nil
 	case 3:
-		var provName *C.char
+		var provName string
 		if enabled {
 			provName = providerNameFips
 		} else {
 			provName = providerNameDefault
 		}
 		// Check if provName is not loaded.
-		if C.go_openssl_OSSL_PROVIDER_available(nil, provName) == 0 {
-			// If not, fallback to provName provider.
-			if C.go_openssl_OSSL_PROVIDER_load(nil, provName) == nil {
-				return newOpenSSLError("openssl: OSSL_PROVIDER_load")
-			}
-			// Make sure we now have a provider available.
-			if C.go_openssl_OSSL_PROVIDER_available(nil, provName) == 0 {
-				return fail("SetFIPS(" + strconv.FormatBool(enabled) + ") not supported")
-			}
+		if err := loadProvider(provName); err != nil {
+			return err
 		}
 		if C.go_openssl_EVP_default_properties_enable_fips(nil, mode) != 1 {
 			return newOpenSSLError("openssl: EVP_default_properties_enable_fips")
@@ -211,6 +212,39 @@ func SetFIPS(enabled bool) error {
 	default:
 		panic(errUnsuportedVersion())
 	}
+}
+
+func SetProvider(prov string) error {
+	if vMajor < 3 {
+		return newOpenSSLError("openssl: provider interface only supported for v3 and higher")
+	}
+
+	if (prov == providerNameFips) {
+		return SetFIPS(true)
+	} else {
+		if err := loadProvider(prov); err != nil {
+			return err
+		}
+		if C.go_openssl_EVP_set_default_properties(nil, C.CString("provider=" + prov)) != 1 {
+			return newOpenSSLError("openssl: EVP_set_default_properties")
+		}
+	}
+	return nil
+}
+
+func loadProvider(prov string) error {
+	provName := C.CString(prov)
+	if C.go_openssl_OSSL_PROVIDER_available(nil, provName) == 0 {
+		// If not, fallback to provName provider.
+		if C.go_openssl_OSSL_PROVIDER_load(nil, provName) == nil {
+			return newOpenSSLError("openssl: could not load " + prov + " provider")
+		}
+		// Make sure we now have the provider available.
+		if C.go_openssl_OSSL_PROVIDER_available(nil, provName) == 0 {
+			return fail(prov + " not supported")
+		}
+	}
+	return nil
 }
 
 // VersionText returns the version text of the OpenSSL currently loaded.
